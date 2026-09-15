@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from pathlib import Path
 
 from sqlalchemy import (
     BigInteger,
@@ -12,7 +13,9 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    event,
 )
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 
@@ -104,7 +107,18 @@ def create_session_factory(database_url: str):
     kwargs = {"pool_pre_ping": True}
     if database_url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+        database_file = make_url(database_url).database
+        if database_file and database_file != ":memory:":
+            Path(database_file).parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(database_url, **kwargs)
+
+    if database_url.startswith("sqlite"):
+        @event.listens_for(engine, "connect")
+        def configure_sqlite(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.close()
+
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
-

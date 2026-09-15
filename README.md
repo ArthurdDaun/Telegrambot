@@ -11,7 +11,7 @@
 - общая статистика прогулов, опозданий и честности;
 - история за последние 7 дней;
 - первые 3 участника регистрируются сами — никаких Telegram ID в коде или настройках;
-- данные хранятся в PostgreSQL и не пропадают после перезапуска Railway;
+- данные хранятся в лёгкой SQLite-базе на постоянном Railway Volume;
 - работает через long polling, поэтому домен и webhook не нужны.
 
 ## Самый простой запуск на Railway с телефона
@@ -26,19 +26,22 @@
 
 1. Откройте [New Project в Railway](https://railway.com/new).
 2. Выберите **Deploy from GitHub repo** → `ArthurdDaun/Telegrambot`.
-3. На схеме проекта нажмите **+ New** → **Database** → **PostgreSQL**.
-4. Откройте сервис с ботом → **Variables** и добавьте:
+3. Откройте сервис с ботом → **Settings** → **Volumes** → **Add Volume**.
+4. Укажите путь подключения Volume: `/data`.
+5. Откройте **Variables** сервиса бота и добавьте:
 
 | Переменная | Значение |
 |---|---|
 | `BOT_TOKEN` | токен от BotFather |
-| `DATABASE_URL` | **Add Reference Variable** → Postgres → `DATABASE_URL` |
+| `DATABASE_PATH` | `/data/school_bot.db` |
 | `APP_TIMEZONE` | `Europe/Moscow` (или ваш часовой пояс) |
 | `MAX_MEMBERS` | `3` |
 | `MORNING_TIME` | `07:00` |
 | `SCHOOL_START_TIME` | `08:30` |
 
-Обязательны только `BOT_TOKEN` и `DATABASE_URL`; для остальных уже заданы значения из таблицы. После добавления переменных Railway обычно запускает новый deploy автоматически. Если не запустил — нажмите **Deploy**.
+Обязательны `BOT_TOKEN` и `DATABASE_PATH`. Для остальных уже заданы значения из таблицы. После добавления Volume и переменных Railway обычно запускает новый deploy автоматически. Если не запустил — нажмите **Deploy**.
+
+PostgreSQL создавать не нужно. Volume нужен обязательно: без него сам бот запустится, но SQLite-файл может исчезнуть после нового deploy.
 
 В логах успешный запуск начинается строкой `Starting school attendance bot`. Для polling-бота публичный домен создавать не требуется. Оставьте **одну реплику** сервиса, иначе несколько процессов будут одновременно получать одни и те же Telegram-обновления.
 
@@ -78,7 +81,7 @@ export BOT_TOKEN="токен"
 python -m school_bot
 ```
 
-Без `DATABASE_URL` бот использует локальный файл SQLite `school_bot.db`. На Railway обязательно подключите PostgreSQL.
+Локально база сохранится в `school_bot.db`. Другой путь можно задать через `DATABASE_PATH`.
 
 ## Разработка
 
@@ -91,7 +94,5 @@ pytest -q
 
 ## Полезные ссылки
 
-- [Railway: PostgreSQL](https://docs.railway.com/databases/postgresql)
-- [Railway: переменные и ссылки между сервисами](https://docs.railway.com/variables#referencing-another-services-variable)
+- [Railway: Volumes](https://docs.railway.com/reference/volumes)
 - [Railway: Dockerfile](https://docs.railway.com/builds/dockerfiles)
-

@@ -16,14 +16,6 @@ def parse_clock(value: str, variable_name: str) -> str:
     return parsed.strftime("%H:%M")
 
 
-def normalize_database_url(value: str) -> str:
-    if value.startswith("postgres://"):
-        return "postgresql+psycopg://" + value.removeprefix("postgres://")
-    if value.startswith("postgresql://"):
-        return "postgresql+psycopg://" + value.removeprefix("postgresql://")
-    return value
-
-
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
@@ -49,11 +41,14 @@ class Settings:
         if max_members < 2:
             raise ValueError("MAX_MEMBERS must be at least 2")
 
+        database_path = os.getenv("DATABASE_PATH", "school_bot.db").strip()
+        if not database_path:
+            raise ValueError("DATABASE_PATH must not be empty")
+        database_url = "sqlite:///" + database_path
+
         return cls(
             bot_token=token,
-            database_url=normalize_database_url(
-                os.getenv("DATABASE_URL", "sqlite:///school_bot.db").strip()
-            ),
+            database_url=database_url,
             max_members=max_members,
             default_timezone=timezone_name,
             default_morning_time=parse_clock(
@@ -63,4 +58,3 @@ class Settings:
                 os.getenv("SCHOOL_START_TIME", "08:30"), "SCHOOL_START_TIME"
             ),
         )
-
