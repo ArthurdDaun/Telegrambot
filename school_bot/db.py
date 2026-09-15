@@ -27,46 +27,55 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class GroupConfig(Base):
-    __tablename__ = "group_configs"
+class Circle(Base):
+    __tablename__ = "circles"
 
-    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    title: Mapped[str] = mapped_column(String(255), default="Школьная группа")
-    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str] = mapped_column(String(12), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), default="Школьная компания")
+    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Yekaterinburg")
     morning_time: Mapped[str] = mapped_column(String(5), default="07:00")
     school_start_time: Mapped[str] = mapped_column(String(5), default="08:30")
     last_prompt_date: Mapped[date | None] = mapped_column(Date, nullable=True)
-    prompt_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    members: Mapped[list["Member"]] = relationship(
+        back_populates="circle", cascade="all, delete-orphan"
+    )
 
 
 class Member(Base):
-    __tablename__ = "members"
-    __table_args__ = (UniqueConstraint("chat_id", "telegram_user_id"),)
+    __tablename__ = "circle_members"
+    __table_args__ = (UniqueConstraint("telegram_user_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    chat_id: Mapped[int] = mapped_column(
-        BigInteger, ForeignKey("group_configs.chat_id", ondelete="CASCADE"), index=True
+    circle_id: Mapped[int] = mapped_column(
+        ForeignKey("circles.id", ondelete="CASCADE"), index=True
     )
     telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    private_chat_id: Mapped[int] = mapped_column(BigInteger)
     display_name: Mapped[str] = mapped_column(String(255))
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_owner: Mapped[bool] = mapped_column(Boolean, default=False)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
     joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    circle: Mapped[Circle] = relationship(back_populates="members")
     attendances: Mapped[list["Attendance"]] = relationship(
         back_populates="member", cascade="all, delete-orphan"
     )
 
 
 class Attendance(Base):
-    __tablename__ = "attendances"
+    __tablename__ = "circle_attendances"
     __table_args__ = (UniqueConstraint("member_id", "day"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    circle_id: Mapped[int] = mapped_column(
+        ForeignKey("circles.id", ondelete="CASCADE"), index=True
+    )
     member_id: Mapped[int] = mapped_column(
-        ForeignKey("members.id", ondelete="CASCADE"), index=True
+        ForeignKey("circle_members.id", ondelete="CASCADE"), index=True
     )
     day: Mapped[date] = mapped_column(Date, index=True)
     status: Mapped[str] = mapped_column(String(24))
@@ -84,15 +93,15 @@ class Attendance(Base):
 
 
 class Reaction(Base):
-    __tablename__ = "reactions"
+    __tablename__ = "circle_reactions"
     __table_args__ = (UniqueConstraint("attendance_id", "voter_member_id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     attendance_id: Mapped[int] = mapped_column(
-        ForeignKey("attendances.id", ondelete="CASCADE"), index=True
+        ForeignKey("circle_attendances.id", ondelete="CASCADE"), index=True
     )
     voter_member_id: Mapped[int] = mapped_column(
-        ForeignKey("members.id", ondelete="CASCADE"), index=True
+        ForeignKey("circle_members.id", ondelete="CASCADE"), index=True
     )
     verdict: Mapped[str] = mapped_column(String(16))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -122,3 +131,4 @@ def create_session_factory(database_url: str):
 
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
+

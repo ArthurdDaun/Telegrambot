@@ -31,7 +31,7 @@ class Settings:
         if not token:
             raise RuntimeError("BOT_TOKEN is not set")
 
-        timezone_name = os.getenv("APP_TIMEZONE", "Europe/Moscow").strip()
+        timezone_name = os.getenv("APP_TIMEZONE", "Asia/Yekaterinburg").strip()
         try:
             ZoneInfo(timezone_name)
         except ZoneInfoNotFoundError as exc:

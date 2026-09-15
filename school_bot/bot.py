@@ -2,28 +2,27 @@ from __future__ import annotations
 
 import html
 import logging
+import secrets
+import string
 from collections import defaultdict
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
-from telegram import (
-    BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-from telegram.constants import ChatMemberStatus, ChatType, ParseMode
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatType, ParseMode
 from telegram.error import BadRequest, Forbidden, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 from school_bot.config import Settings, parse_clock
-from school_bot.db import Attendance, GroupConfig, Member, Reaction, create_session_factory
+from school_bot.db import Attendance, Circle, Member, Reaction, create_session_factory
 from school_bot.services import (
     calculate_arrival,
     credibility_percent,
@@ -39,21 +38,23 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
+CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-HELP_TEXT = """<b>Что умеет бот</b>
+HELP_TEXT = """<b>Школьная компания</b>
 
-/join — занять место участника
-/today — отметить сегодняшний статус и увидеть всех
-/verify — проверить обещания: «пиздабол / не пиздабол»
+Каждый общается со мной только в личке. Первый человек создаёт компанию и отправляет двум друзьям ссылку. Все статусы и оценки синхронизируются между вашими отдельными диалогами.
+
+/create — создать компанию
+/join КОД — войти по коду
+/today — отметить статус и увидеть всех
+/verify — «пиздабол / не пиздабол»
 /stats — общая статистика
 /history — история за 7 дней
-/members — список участников
-/remove — освободить место (ответом на сообщение, для админа)
-/settings — время рассылки и начала школы
-/setup 07:00 08:30 — настроить группу (для админа)
-/help — эта справка
-
-Каждое утро бот сам пришлёт карточку. Все действия делаются кнопками."""
+/members — участники
+/invite — ссылка для приглашения
+/settings — время рассылки
+/setup 07:00 08:30 — изменить время (создатель)
+/help — эта справка"""
 
 
 def session_factory(application: Application):
@@ -64,13 +65,33 @@ def settings(application: Application) -> Settings:
     return application.bot_data["settings"]
 
 
-def is_group(update: Update) -> bool:
-    chat = update.effective_chat
-    return bool(chat and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP})
-
-
 def display_name(user) -> str:
     return user.full_name.strip() or (f"@{user.username}" if user.username else "Участник")
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✨ Создать компанию", callback_data="home:create")],
+            [InlineKeyboardButton("🔑 Войти по коду", callback_data="home:join")],
+        ]
+    )
+
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🏫 Отметиться", callback_data="nav:today"),
+                InlineKeyboardButton("🔎 Проверить", callback_data="nav:verify"),
+            ],
+            [
+                InlineKeyboardButton("📊 Статистика", callback_data="nav:stats"),
+                InlineKeyboardButton("🗓 История", callback_data="nav:history"),
+            ],
+            [InlineKeyboardButton("👥 Участники и ссылка", callback_data="nav:members")],
+        ]
+    )
 
 
 def status_keyboard() -> InlineKeyboardMarkup:
@@ -86,17 +107,17 @@ def status_keyboard() -> InlineKeyboardMarkup:
 
 def delay_keyboard(member_id: int) -> InlineKeyboardMarkup:
     choices = (5, 10, 15, 20, 30, 45, 60)
-    rows = []
-    for index in range(0, len(choices), 3):
-        rows.append(
+    return InlineKeyboardMarkup(
+        [
             [
                 InlineKeyboardButton(
                     f"{minutes} мин", callback_data=f"l:{member_id}:{minutes}"
                 )
                 for minutes in choices[index : index + 3]
             ]
-        )
-    return InlineKeyboardMarkup(rows)
+            for index in range(0, len(choices), 3)
+        ]
+    )
 
 
 def reaction_keyboard(attendance_id: int, truth: int, lie: int) -> InlineKeyboardMarkup:
@@ -114,81 +135,134 @@ def reaction_keyboard(attendance_id: int, truth: int, lie: int) -> InlineKeyboar
     )
 
 
-def get_member(db, chat_id: int, telegram_user_id: int) -> Member | None:
-    return db.scalar(
-        select(Member).where(
-            Member.chat_id == chat_id,
-            Member.telegram_user_id == telegram_user_id,
-            Member.active.is_(True),
-        )
+def get_member(db, telegram_user_id: int, active_only: bool = True) -> Member | None:
+    query = select(Member).where(Member.telegram_user_id == telegram_user_id)
+    if active_only:
+        query = query.where(Member.active.is_(True))
+    return db.scalar(query)
+
+
+def circle_members(db, circle_id: int) -> list[Member]:
+    return list(
+        db.scalars(
+            select(Member)
+            .where(Member.circle_id == circle_id, Member.active.is_(True))
+            .order_by(Member.joined_at)
+        ).all()
     )
 
 
-def register_member(db, chat_id: int, user, limit: int) -> tuple[Member | None, str]:
-    member = db.scalar(
-        select(Member).where(
-            Member.chat_id == chat_id, Member.telegram_user_id == user.id
+def create_code(db) -> str:
+    for _ in range(30):
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
+        if not db.scalar(select(Circle.id).where(Circle.code == code)):
+            return code
+    raise RuntimeError("Could not generate a unique invite code")
+
+
+def local_day(circle: Circle):
+    return datetime.now(ZoneInfo(circle.timezone)).date()
+
+
+def create_circle(db, user, chat_id: int, app_settings: Settings) -> tuple[Circle | None, str]:
+    existing = get_member(db, user.id, active_only=False)
+    if existing and existing.active:
+        return db.get(Circle, existing.circle_id), "already"
+    if existing:
+        return None, "removed"
+
+    circle = Circle(
+        code=create_code(db),
+        timezone=app_settings.default_timezone,
+        morning_time=app_settings.default_morning_time,
+        school_start_time=app_settings.default_school_start_time,
+    )
+    db.add(circle)
+    db.flush()
+    db.add(
+        Member(
+            circle_id=circle.id,
+            telegram_user_id=user.id,
+            private_chat_id=chat_id,
+            display_name=display_name(user),
+            username=user.username,
+            is_owner=True,
         )
     )
-    if member:
-        member.display_name = display_name(user)
-        member.username = user.username
-        member.active = True
+    db.commit()
+    return circle, "created"
+
+
+def join_circle(
+    db, code: str, user, chat_id: int, limit: int
+) -> tuple[Circle | None, Member | None, str]:
+    circle = db.scalar(select(Circle).where(Circle.code == code.upper().strip()))
+    if not circle:
+        return None, None, "bad_code"
+
+    existing = get_member(db, user.id, active_only=False)
+    if existing:
+        if existing.circle_id != circle.id:
+            return circle, existing, "other_circle"
+        was_active = existing.active
+        existing.active = True
+        existing.private_chat_id = chat_id
+        existing.display_name = display_name(user)
+        existing.username = user.username
         db.commit()
-        return member, "existing"
+        return circle, existing, "already" if was_active else "joined"
 
     count = db.scalar(
         select(func.count(Member.id)).where(
-            Member.chat_id == chat_id, Member.active.is_(True)
+            Member.circle_id == circle.id, Member.active.is_(True)
         )
     )
     if (count or 0) >= limit:
-        return None, "full"
-
+        return circle, None, "full"
     member = Member(
-        chat_id=chat_id,
+        circle_id=circle.id,
         telegram_user_id=user.id,
+        private_chat_id=chat_id,
         display_name=display_name(user),
         username=user.username,
     )
     db.add(member)
     db.commit()
-    return member, "created"
+    return circle, member, "joined"
 
 
-def local_day(config: GroupConfig):
-    return datetime.now(ZoneInfo(config.timezone)).date()
+def invite_text(circle: Circle, bot_username: str) -> str:
+    link = f"https://t.me/{bot_username}?start={circle.code}"
+    return (
+        "🔗 <b>Приглашение в компанию</b>\n\n"
+        f"Код: <code>{circle.code}</code>\n"
+        f"Ссылка: {link}\n\n"
+        "Отправь ссылку двум друзьям. Они будут общаться с ботом в своих личных чатах."
+    )
 
 
-def render_daily_summary(db, config: GroupConfig, day) -> str:
-    members = db.scalars(
-        select(Member)
-        .where(Member.chat_id == config.chat_id, Member.active.is_(True))
-        .order_by(Member.joined_at)
-    ).all()
+def render_daily_summary(db, circle: Circle, day) -> str:
+    members = circle_members(db, circle.id)
     records = db.scalars(
         select(Attendance).where(
-            Attendance.chat_id == config.chat_id, Attendance.day == day
+            Attendance.circle_id == circle.id, Attendance.day == day
         )
     ).all()
     by_member = {record.member_id: record for record in records}
-
-    lines = [f"🏫 <b>Школа · {day.strftime('%d.%m.%Y')}</b>", ""]
-    if not members:
-        lines.append("Пока никто не зарегистрирован. Нажмите /join.")
+    lines = [f"🏫 <b>Сегодня · {day.strftime('%d.%m.%Y')}</b>", ""]
     for member in members:
         record = by_member.get(member.id)
-        current = (
+        status = (
             describe_status(record.status, record.delay_minutes, record.arrival_time)
             if record
             else "➖ Ещё не отметил"
         )
-        lines.append(f"<b>{html.escape(member.display_name)}</b> — {current}")
-    lines.extend(["", "Выбери свой статус кнопкой ниже 👇"])
+        lines.append(f"<b>{html.escape(member.display_name)}</b> — {status}")
+    lines.extend(["", "Выбери свой статус 👇"])
     return "\n".join(lines)
 
 
-def get_verification_data(db, attendance_id: int):
+def verification_data(db, attendance_id: int):
     attendance = db.get(Attendance, attendance_id)
     if not attendance:
         return None
@@ -208,13 +282,10 @@ def render_verification_card(data) -> str:
     attendance, author, votes, _, _ = data
     lines = [
         f"<b>{html.escape(author.display_name)}</b>",
-        describe_status(
-            attendance.status, attendance.delay_minutes, attendance.arrival_time
-        ),
+        describe_status(attendance.status, attendance.delay_minutes, attendance.arrival_time),
     ]
     if votes:
-        lines.append("")
-        lines.append("<b>Проверили:</b>")
+        lines.extend(["", "<b>Проверили:</b>"])
         for vote, voter in votes:
             verdict = "✅ не пиздабол" if vote.verdict == "truth" else "🤥 пиздабол"
             lines.append(f"• {html.escape(voter.display_name)} — {verdict}")
@@ -223,270 +294,385 @@ def render_verification_card(data) -> str:
     return "\n".join(lines)
 
 
-async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    chat = update.effective_chat
-    user = update.effective_user
-    if not chat or not user:
-        return False
-    try:
-        membership = await context.bot.get_chat_member(chat.id, user.id)
-    except TelegramError:
-        return False
-    return membership.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
-
-
-async def require_group(update: Update) -> bool:
-    if is_group(update):
+async def require_private(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if update.effective_chat and update.effective_chat.type == ChatType.PRIVATE:
         return True
     if update.effective_message:
+        username = context.bot.username
         await update.effective_message.reply_text(
-            "Добавь меня в общую Telegram-группу и используй команды там."
+            "Я работаю только в личных сообщениях. Открой меня здесь:\n"
+            f"https://t.me/{username}"
         )
     return False
 
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_group(update):
-        await update.effective_message.reply_text(
-            "Привет! Я веду посещаемость маленькой школьной компании.\n\n"
-            "Добавь меня в вашу общую группу, затем админ группы должен отправить "
-            "/setup 07:00 08:30."
-        )
-        return
-    await join_command(update, context)
-
-
-async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
-        return
-    if not await is_admin(update, context):
-        await update.effective_message.reply_text("Настраивать бота может админ группы.")
-        return
-
-    app_settings = settings(context.application)
-    morning = app_settings.default_morning_time
-    school_start = app_settings.default_school_start_time
-    try:
-        if context.args:
-            morning = parse_clock(context.args[0], "время рассылки")
-        if len(context.args) > 1:
-            school_start = parse_clock(context.args[1], "время начала школы")
-        if len(context.args) > 2:
-            raise ValueError
-    except ValueError:
-        await update.effective_message.reply_text(
-            "Формат: /setup 07:00 08:30\n"
-            "Первое — утренняя рассылка, второе — начало школы."
-        )
-        return
-
-    chat = update.effective_chat
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat.id)
-        if not config:
-            config = GroupConfig(
-                chat_id=chat.id,
-                title=chat.title or "Школьная группа",
-                timezone=app_settings.default_timezone,
-                morning_time=morning,
-                school_start_time=school_start,
+async def notify_circle(
+    application: Application,
+    circle_id: int,
+    text: str,
+    exclude_user_id: int | None = None,
+) -> None:
+    with session_factory(application)() as db:
+        recipients = [
+            (member.telegram_user_id, member.private_chat_id)
+            for member in circle_members(db, circle_id)
+            if member.telegram_user_id != exclude_user_id
+        ]
+    for _, chat_id in recipients:
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=main_keyboard(),
             )
-            db.add(config)
-        else:
-            config.title = chat.title or config.title
-            config.timezone = app_settings.default_timezone
-            config.morning_time = morning
-            config.school_start_time = school_start
-        db.commit()
-        _, join_result = register_member(
-            db, chat.id, update.effective_user, app_settings.max_members
-        )
+        except Forbidden:
+            logger.info("Member %s blocked the bot", chat_id)
+        except TelegramError:
+            logger.exception("Could not notify private chat %s", chat_id)
 
-    join_note = (
-        "\nТы также зарегистрирован как участник."
-        if join_result == "created"
-        else ""
+
+async def show_home(chat_id: int, user_id: int, application: Application) -> None:
+    with session_factory(application)() as db:
+        member = get_member(db, user_id)
+        if not member:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text="Привет! Создай свою компанию или войди по приглашению друга.",
+                reply_markup=start_keyboard(),
+            )
+            return
+        circle = db.get(Circle, member.circle_id)
+        members = circle_members(db, circle.id)
+        text = (
+            f"🏫 <b>{html.escape(circle.name)}</b>\n"
+            f"Участников: <b>{len(members)}/{settings(application).max_members}</b>\n"
+            f"Утренняя отметка: <b>{circle.morning_time}</b> ({html.escape(circle.timezone)})"
+        )
+    await application.bot.send_message(
+        chat_id=chat_id, text=text, parse_mode=ParseMode.HTML, reply_markup=main_keyboard()
     )
+
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context):
+        return
+    context.user_data.pop("awaiting_join_code", None)
+    if context.args:
+        await process_join(update, context, context.args[0])
+        return
+    await show_home(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+async def create_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context):
+        return
+    with session_factory(context.application)() as db:
+        circle, result = create_circle(
+            db,
+            update.effective_user,
+            update.effective_chat.id,
+            settings(context.application),
+        )
+    if result == "removed":
+        await update.effective_message.reply_text(
+            "Ты был удалён из прежней компании. Для возврата нужна её ссылка или код."
+        )
+        return
+    if result == "already":
+        await update.effective_message.reply_text("Ты уже состоишь в компании.")
+        await show_home(update.effective_chat.id, update.effective_user.id, context.application)
+        return
     await update.effective_message.reply_text(
-        "✅ <b>Группа настроена</b>\n"
-        f"Утренняя карточка: <b>{morning}</b>\n"
-        f"Начало школы: <b>{school_start}</b>\n"
-        f"Часовой пояс: <b>{html.escape(app_settings.default_timezone)}</b>\n\n"
-        f"Теперь остальные участники нажимают /join.{join_note}",
+        "✅ Компания создана!\n\n" + invite_text(circle, context.bot.username),
         parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def process_join(update: Update, context: ContextTypes.DEFAULT_TYPE, code: str) -> None:
+    if not await require_private(update, context):
+        return
+    with session_factory(context.application)() as db:
+        circle, member, result = join_circle(
+            db,
+            code,
+            update.effective_user,
+            update.effective_chat.id,
+            settings(context.application).max_members,
+        )
+    if result == "bad_code":
+        await update.effective_message.reply_text("Такого кода нет. Проверь код или попроси новую ссылку.")
+        return
+    if result == "full":
+        await update.effective_message.reply_text("В этой компании уже заняты все три места.")
+        return
+    if result == "other_circle":
+        await update.effective_message.reply_text("Ты уже привязан к другой компании.")
+        return
+    if result == "already":
+        await update.effective_message.reply_text("Ты уже состоишь в этой компании 👍")
+        await show_home(update.effective_chat.id, update.effective_user.id, context.application)
+        return
+
+    await update.effective_message.reply_text(
+        "✅ Ты присоединился! Все участники общаются со мной отдельно, "
+        "но видят общие статусы и статистику.",
+        reply_markup=main_keyboard(),
+    )
+    await notify_circle(
+        context.application,
+        circle.id,
+        f"👋 <b>{html.escape(member.display_name)}</b> присоединился к компании.",
+        exclude_user_id=member.telegram_user_id,
     )
 
 
 async def join_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+    if not await require_private(update, context):
         return
-    chat = update.effective_chat
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat.id)
-        if not config:
-            await update.effective_message.reply_text(
-                "Сначала админ группы должен выполнить /setup 07:00 08:30."
-            )
-            return
-        member, result = register_member(
-            db, chat.id, update.effective_user, settings(context.application).max_members
-        )
-
-    if result == "full":
-        await update.effective_message.reply_text(
-            "Все места уже заняты. Лимит меняется переменной MAX_MEMBERS в Railway."
-        )
-    elif result == "created":
-        await update.effective_message.reply_text(
-            f"✅ {html.escape(member.display_name)}, ты в списке!",
-            parse_mode=ParseMode.HTML,
-        )
-    else:
-        await update.effective_message.reply_text("Ты уже в списке 👍")
-
-
-async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+    if context.args:
+        await process_join(update, context, context.args[0])
         return
-    chat = update.effective_chat
-    with session_factory(context.application)() as db:
-        members = db.scalars(
-            select(Member)
-            .where(Member.chat_id == chat.id, Member.active.is_(True))
-            .order_by(Member.joined_at)
-        ).all()
-    limit = settings(context.application).max_members
-    lines = [f"👥 <b>Участники ({len(members)}/{limit})</b>"]
-    lines.extend(f"{number}. {html.escape(m.display_name)}" for number, m in enumerate(members, 1))
-    if len(members) < limit:
-        lines.append("\nСвободный участник может нажать /join.")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def remove_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
-        return
-    if not await is_admin(update, context):
-        await update.effective_message.reply_text("Освобождать места может админ группы.")
-        return
-    replied = update.effective_message.reply_to_message
-    if not replied or not replied.from_user:
-        await update.effective_message.reply_text(
-            "Ответь командой /remove на сообщение участника, которого нужно убрать."
-        )
-        return
-    with session_factory(context.application)() as db:
-        member = get_member(db, update.effective_chat.id, replied.from_user.id)
-        if not member:
-            await update.effective_message.reply_text("Этот человек не занимает место.")
-            return
-        removed_name = member.display_name
-        member.active = False
-        db.commit()
+    context.user_data["awaiting_join_code"] = True
     await update.effective_message.reply_text(
-        f"Место {html.escape(removed_name)} освобождено. История сохранена.",
-        parse_mode=ParseMode.HTML,
+        "Пришли шестизначный код компании одним сообщением."
     )
 
 
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+async def text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.pop("awaiting_join_code", False):
         return
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, update.effective_chat.id)
-        if not config:
-            await update.effective_message.reply_text("Бот ещё не настроен: /setup 07:00 08:30")
+    await process_join(update, context, update.effective_message.text)
+
+
+async def send_today(chat_id: int, user_id: int, application: Application) -> None:
+    with session_factory(application)() as db:
+        member = get_member(db, user_id)
+        if not member:
+            await application.bot.send_message(chat_id, "Сначала создай компанию или войди по коду: /start")
             return
-        text = (
-            "⚙️ <b>Настройки</b>\n"
-            f"Утренняя карточка: <b>{config.morning_time}</b>\n"
-            f"Начало школы: <b>{config.school_start_time}</b>\n"
-            f"Часовой пояс: <b>{html.escape(config.timezone)}</b>\n"
-            f"Лимит участников: <b>{settings(context.application).max_members}</b>\n\n"
-            "Изменить время: /setup 07:00 08:30"
-        )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+        circle = db.get(Circle, member.circle_id)
+        text = render_daily_summary(db, circle, local_day(circle))
+    await application.bot.send_message(
+        chat_id, text, parse_mode=ParseMode.HTML, reply_markup=status_keyboard()
+    )
 
 
 async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+    if await require_private(update, context):
+        await send_today(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+def upsert_attendance(
+    db,
+    circle: Circle,
+    member: Member,
+    status: str,
+    delay_minutes: int | None = None,
+    arrival_time: str | None = None,
+) -> Attendance:
+    day = local_day(circle)
+    record = db.scalar(
+        select(Attendance).where(Attendance.member_id == member.id, Attendance.day == day)
+    )
+    if not record:
+        record = Attendance(circle_id=circle.id, member_id=member.id, day=day, status=status)
+        db.add(record)
+    record.status = status
+    record.delay_minutes = delay_minutes
+    record.arrival_time = arrival_time
+    db.commit()
+    return record
+
+
+async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
         return
-    chat_id = update.effective_chat.id
+    action = query.data.split(":", 1)[1]
     with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config:
-            await update.effective_message.reply_text("Сначала настройте бота: /setup 07:00 08:30")
+        member = get_member(db, update.effective_user.id)
+        if not member:
+            await query.answer("Сначала /start", show_alert=True)
             return
-        day = local_day(config)
-        text = render_daily_summary(db, config, day)
-    await update.effective_message.reply_text(
-        text, parse_mode=ParseMode.HTML, reply_markup=status_keyboard()
+        circle = db.get(Circle, member.circle_id)
+        if action == "late":
+            member_id = member.id
+        else:
+            record = upsert_attendance(db, circle, member, action)
+            status_text = describe_status(record.status)
+            summary = render_daily_summary(db, circle, record.day)
+            circle_id = circle.id
+            member_name = member.display_name
+
+    if action == "late":
+        await query.answer()
+        await query.message.reply_text(
+            "На сколько опоздаешь?",
+            reply_markup=delay_keyboard(member_id),
+        )
+        return
+    await query.answer("Сохранено ✅")
+    try:
+        await query.edit_message_text(
+            summary, parse_mode=ParseMode.HTML, reply_markup=status_keyboard()
+        )
+    except BadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+    await notify_circle(
+        context.application,
+        circle_id,
+        f"🔔 <b>{html.escape(member_name)}</b> отметил: {status_text}",
+        exclude_user_id=update.effective_user.id,
     )
 
 
-async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+async def late_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
         return
-    chat_id = update.effective_chat.id
-    cards = []
+    _, requested_member_id, minutes_text = query.data.split(":")
     with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config:
-            await update.effective_message.reply_text("Сначала настройте бота: /setup 07:00 08:30")
+        member = get_member(db, update.effective_user.id)
+        if not member or member.id != int(requested_member_id):
+            await query.answer("Это кнопки другого участника", show_alert=True)
             return
-        day = local_day(config)
+        circle = db.get(Circle, member.circle_id)
+        minutes = int(minutes_text)
+        arrival = calculate_arrival(circle.school_start_time, minutes)
+        record = upsert_attendance(db, circle, member, "late", minutes, arrival)
+        circle_id = circle.id
+        member_name = member.display_name
+    await query.answer("Сохранено ✅")
+    await query.edit_message_text(
+        f"✅ Опоздание на {minutes} мин. Будешь к {arrival}.",
+    )
+    await notify_circle(
+        context.application,
+        circle_id,
+        f"🔔 <b>{html.escape(member_name)}</b> отметил: "
+        f"{describe_status('late', minutes, arrival)}",
+        exclude_user_id=update.effective_user.id,
+    )
+    await send_today(query.message.chat.id, update.effective_user.id, context.application)
+
+
+async def send_verify(chat_id: int, user_id: int, application: Application) -> None:
+    cards = []
+    with session_factory(application)() as db:
+        member = get_member(db, user_id)
+        if not member:
+            await application.bot.send_message(chat_id, "Сначала /start")
+            return
+        circle = db.get(Circle, member.circle_id)
         attendance_ids = db.scalars(
             select(Attendance.id)
-            .where(Attendance.chat_id == chat_id, Attendance.day == day)
+            .where(Attendance.circle_id == circle.id, Attendance.day == local_day(circle))
             .order_by(Attendance.id)
         ).all()
         for attendance_id in attendance_ids:
-            data = get_verification_data(db, attendance_id)
-            if data:
-                cards.append((render_verification_card(data), attendance_id, data[3], data[4]))
-
+            data = verification_data(db, attendance_id)
+            cards.append((render_verification_card(data), attendance_id, data[3], data[4]))
     if not cards:
-        await update.effective_message.reply_text("Сегодня пока нечего проверять.")
+        await application.bot.send_message(chat_id, "Сегодня пока нечего проверять.")
         return
-    await update.effective_message.reply_text(
-        "🔎 <b>Проверка обещаний за сегодня</b>\n"
-        "Каждый может поставить или поменять одну оценку. Себя оценивать нельзя.",
+    await application.bot.send_message(
+        chat_id,
+        "🔎 <b>Проверка за сегодня</b>\nОценку можно изменить. Себя оценивать нельзя.",
         parse_mode=ParseMode.HTML,
     )
     for text, attendance_id, truth, lie in cards:
-        await update.effective_message.reply_text(
+        await application.bot.send_message(
+            chat_id,
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=reaction_keyboard(attendance_id, truth, lie),
         )
 
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
+async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await require_private(update, context):
+        await send_verify(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query or not update.effective_user:
         return
-    chat_id = update.effective_chat.id
+    _, attendance_id_text, verdict = query.data.split(":")
+    attendance_id = int(attendance_id_text)
     with session_factory(context.application)() as db:
-        members = db.scalars(
-            select(Member)
-            .where(Member.chat_id == chat_id, Member.active.is_(True))
-            .order_by(Member.joined_at)
-        ).all()
-        if not members:
-            await update.effective_message.reply_text("Статистики пока нет.")
+        voter = get_member(db, update.effective_user.id)
+        attendance = db.get(Attendance, attendance_id)
+        if not voter or not attendance or attendance.circle_id != voter.circle_id:
+            await query.answer("Отметка недоступна", show_alert=True)
+            return
+        if voter.id == attendance.member_id:
+            await query.answer("Себя оценивать нельзя 🙂", show_alert=True)
+            return
+        reaction = db.scalar(
+            select(Reaction).where(
+                Reaction.attendance_id == attendance.id,
+                Reaction.voter_member_id == voter.id,
+            )
+        )
+        if reaction:
+            reaction.verdict = verdict
+        else:
+            db.add(
+                Reaction(
+                    attendance_id=attendance.id,
+                    voter_member_id=voter.id,
+                    verdict=verdict,
+                )
+            )
+        db.commit()
+        data = verification_data(db, attendance.id)
+        text = render_verification_card(data)
+        truth, lie = data[3], data[4]
+        author_name = data[1].display_name
+        voter_name = voter.display_name
+        circle_id = voter.circle_id
+    await query.answer("Оценка сохранена")
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=reaction_keyboard(attendance_id, truth, lie),
+    )
+    verdict_text = "✅ не пиздабол" if verdict == "truth" else "🤥 пиздабол"
+    await notify_circle(
+        context.application,
+        circle_id,
+        f"🔎 <b>{html.escape(voter_name)}</b> оценил "
+        f"<b>{html.escape(author_name)}</b>: {verdict_text}",
+        exclude_user_id=update.effective_user.id,
+    )
+
+
+async def send_stats(chat_id: int, user_id: int, application: Application) -> None:
+    with session_factory(application)() as db:
+        current = get_member(db, user_id)
+        if not current:
+            await application.bot.send_message(chat_id, "Сначала /start")
             return
         blocks = ["📊 <b>Общая статистика</b>"]
-        for member in members:
-            statuses = db.scalars(
-                select(Attendance.status).where(Attendance.member_id == member.id)
-            ).all()
+        for member in circle_members(db, current.circle_id):
+            statuses = list(
+                db.scalars(select(Attendance.status).where(Attendance.member_id == member.id)).all()
+            )
             counts = status_counts(statuses)
-            received_votes = db.scalars(
-                select(Reaction.verdict)
-                .join(Attendance, Reaction.attendance_id == Attendance.id)
-                .where(Attendance.member_id == member.id)
-            ).all()
-            truth = sum(1 for vote in received_votes if vote == "truth")
-            lie = sum(1 for vote in received_votes if vote == "lie")
+            votes = list(
+                db.scalars(
+                    select(Reaction.verdict)
+                    .join(Attendance, Reaction.attendance_id == Attendance.id)
+                    .where(Attendance.member_id == member.id)
+                ).all()
+            )
+            truth = votes.count("truth")
+            lie = votes.count("lie")
             credibility = credibility_percent(truth, lie)
             score = "нет оценок" if credibility is None else f"{credibility}%"
             blocks.append(
@@ -497,26 +683,30 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 f"Скорее не придёт: {counts['maybe']} · Прогулов: {counts['absent']}\n"
                 f"Не пиздабол: {truth} · Пиздабол: {lie} · Честность: <b>{score}</b>"
             )
-    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.HTML)
+    await application.bot.send_message(
+        chat_id, "\n".join(blocks), parse_mode=ParseMode.HTML, reply_markup=main_keyboard()
+    )
 
 
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_group(update):
-        return
-    chat_id = update.effective_chat.id
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config:
-            await update.effective_message.reply_text("Сначала настройте бота: /setup 07:00 08:30")
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await require_private(update, context):
+        await send_stats(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+async def send_history(chat_id: int, user_id: int, application: Application) -> None:
+    with session_factory(application)() as db:
+        current = get_member(db, user_id)
+        if not current:
+            await application.bot.send_message(chat_id, "Сначала /start")
             return
-        today = local_day(config)
-        start = today - timedelta(days=6)
+        circle = db.get(Circle, current.circle_id)
+        today = local_day(circle)
         rows = db.execute(
             select(Attendance, Member)
             .join(Member, Attendance.member_id == Member.id)
             .where(
-                Attendance.chat_id == chat_id,
-                Attendance.day >= start,
+                Attendance.circle_id == circle.id,
+                Attendance.day >= today - timedelta(days=6),
                 Attendance.day <= today,
             )
             .order_by(Attendance.day.desc(), Member.joined_at)
@@ -528,251 +718,251 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         for day in sorted(grouped, reverse=True):
             lines.append(f"\n<b>{day.strftime('%d.%m.%Y')}</b>")
             for attendance, member in grouped[day]:
-                status = describe_status(
-                    attendance.status,
-                    attendance.delay_minutes,
-                    attendance.arrival_time,
+                lines.append(
+                    f"• {html.escape(member.display_name)} — "
+                    f"{describe_status(attendance.status, attendance.delay_minutes, attendance.arrival_time)}"
                 )
-                lines.append(f"• {html.escape(member.display_name)} — {status}")
-    if not rows:
-        lines.append("\nПока нет отметок.")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        if not rows:
+            lines.append("\nПока нет отметок.")
+    await application.bot.send_message(
+        chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=main_keyboard()
+    )
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await require_private(update, context):
+        await send_history(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+async def send_members(chat_id: int, user_id: int, application: Application) -> None:
+    with session_factory(application)() as db:
+        current = get_member(db, user_id)
+        if not current:
+            await application.bot.send_message(chat_id, "Сначала /start")
+            return
+        circle = db.get(Circle, current.circle_id)
+        members = circle_members(db, circle.id)
+        lines = [f"👥 <b>Участники ({len(members)}/{settings(application).max_members})</b>"]
+        lines.extend(
+            f"{index}. {html.escape(member.display_name)}"
+            + (" 👑" if member.is_owner else "")
+            for index, member in enumerate(members, 1)
+        )
+        lines.extend(["", invite_text(circle, application.bot.username)])
+        markup = None
+        if current.is_owner:
+            removable = [member for member in members if member.id != current.id]
+            if removable:
+                markup = InlineKeyboardMarkup(
+                    [
+                        [
+                            InlineKeyboardButton(
+                                f"Убрать {member.display_name}", callback_data=f"m:remove:{member.id}"
+                            )
+                        ]
+                        for member in removable
+                    ]
+                )
+    await application.bot.send_message(
+        chat_id,
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=markup or main_keyboard(),
+        disable_web_page_preview=True,
+    )
+
+
+async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if await require_private(update, context):
+        await send_members(update.effective_chat.id, update.effective_user.id, context.application)
+
+
+async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context):
+        return
+    with session_factory(context.application)() as db:
+        member = get_member(db, update.effective_user.id)
+        if not member:
+            await update.effective_message.reply_text("Сначала /start")
+            return
+        circle = db.get(Circle, member.circle_id)
+        text = invite_text(circle, context.bot.username)
+    await update.effective_message.reply_text(
+        text, parse_mode=ParseMode.HTML, disable_web_page_preview=True
+    )
+
+
+async def remove_member_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, _, target_id_text = query.data.split(":")
+    with session_factory(context.application)() as db:
+        owner = get_member(db, update.effective_user.id)
+        target = db.get(Member, int(target_id_text))
+        if (
+            not owner
+            or not owner.is_owner
+            or not target
+            or target.circle_id != owner.circle_id
+            or target.id == owner.id
+        ):
+            await query.answer("Недостаточно прав", show_alert=True)
+            return
+        target.active = False
+        target_name = target.display_name
+        target_chat_id = target.private_chat_id
+        circle_id = owner.circle_id
+        db.commit()
+    await query.answer("Участник удалён")
+    await query.edit_message_text(f"Место {html.escape(target_name)} освобождено.", parse_mode=ParseMode.HTML)
+    try:
+        await context.bot.send_message(
+            target_chat_id, "Ты удалён из компании. Чтобы вернуться, понадобится новая ссылка."
+        )
+    except TelegramError:
+        pass
+    await notify_circle(
+        context.application,
+        circle_id,
+        f"👋 <b>{html.escape(target_name)}</b> удалён из компании.",
+        exclude_user_id=update.effective_user.id,
+    )
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context):
+        return
+    with session_factory(context.application)() as db:
+        member = get_member(db, update.effective_user.id)
+        if not member:
+            await update.effective_message.reply_text("Сначала /start")
+            return
+        circle = db.get(Circle, member.circle_id)
+        text = (
+            "⚙️ <b>Настройки компании</b>\n"
+            f"Утренняя карточка: <b>{circle.morning_time}</b>\n"
+            f"Начало школы: <b>{circle.school_start_time}</b>\n"
+            f"Часовой пояс: <b>{html.escape(circle.timezone)}</b>"
+        )
+        if member.is_owner:
+            text += "\n\nИзменить: /setup 07:00 08:30"
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def setup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context):
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text(
+            "Формат: /setup 07:00 08:30\nПервое — рассылка, второе — начало школы."
+        )
+        return
+    try:
+        morning = parse_clock(context.args[0], "время рассылки")
+        school_start = parse_clock(context.args[1], "время школы")
+    except ValueError:
+        await update.effective_message.reply_text("Используй время в формате ЧЧ:ММ.")
+        return
+    with session_factory(context.application)() as db:
+        member = get_member(db, update.effective_user.id)
+        if not member or not member.is_owner:
+            await update.effective_message.reply_text("Менять время может создатель компании.")
+            return
+        circle = db.get(Circle, member.circle_id)
+        circle.morning_time = morning
+        circle.school_start_time = school_start
+        circle.timezone = settings(context.application).default_timezone
+        db.commit()
+    await update.effective_message.reply_text(
+        f"✅ Рассылка: {morning}, начало школы: {school_start}, "
+        f"часовой пояс {settings(context.application).default_timezone}."
+    )
+
+
+async def nav_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    action = query.data.split(":", 1)[1]
+    chat_id = query.message.chat.id
+    user_id = update.effective_user.id
+    actions = {
+        "today": send_today,
+        "verify": send_verify,
+        "stats": send_stats,
+        "history": send_history,
+        "members": send_members,
+    }
+    await actions[action](chat_id, user_id, context.application)
+
+
+async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    await query.answer()
+    if action == "create":
+        await create_command(update, context)
+    else:
+        context.user_data["awaiting_join_code"] = True
+        await query.message.reply_text("Пришли шестизначный код компании одним сообщением.")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
-
-
-def upsert_attendance(
-    db,
-    chat_id: int,
-    member: Member,
-    day,
-    status: str,
-    delay_minutes: int | None = None,
-    arrival_time: str | None = None,
-) -> Attendance:
-    record = db.scalar(
-        select(Attendance).where(
-            Attendance.member_id == member.id, Attendance.day == day
-        )
+    await update.effective_message.reply_text(
+        HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=main_keyboard()
     )
-    if not record:
-        record = Attendance(chat_id=chat_id, member_id=member.id, day=day, status=status)
-        db.add(record)
-    record.status = status
-    record.delay_minutes = delay_minutes
-    record.arrival_time = arrival_time
-    db.commit()
-    return record
 
 
-async def refresh_saved_prompt(
-    application: Application, chat_id: int, day, skip_message_id: int | None = None
-) -> None:
+async def send_morning_prompt(application: Application, circle: Circle) -> None:
     with session_factory(application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config or config.last_prompt_date != day or not config.prompt_message_id:
+        stored_circle = db.get(Circle, circle.id)
+        if not stored_circle:
             return
-        if config.prompt_message_id == skip_message_id:
-            return
-        text = render_daily_summary(db, config, day)
-        message_id = config.prompt_message_id
-    try:
-        await application.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=message_id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=status_keyboard(),
+        day = local_day(stored_circle)
+        text = "☀️ <b>Доброе утро!</b>\nПора отметиться.\n\n" + render_daily_summary(
+            db, stored_circle, day
         )
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            logger.info("Could not refresh daily prompt: %s", exc)
-
-
-async def status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.message or not update.effective_user:
-        return
-    chat_id = query.message.chat.id
-    app_settings = settings(context.application)
-
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config:
-            await query.answer("Сначала нужен /setup", show_alert=True)
-            return
-        member, result = register_member(db, chat_id, update.effective_user, app_settings.max_members)
-        if result == "full" or not member:
-            await query.answer("Ты не в списке участников", show_alert=True)
-            return
-        day = local_day(config)
-        action = query.data.split(":", 1)[1]
-        if action == "late":
-            member_id = member.id
-        else:
-            upsert_attendance(db, chat_id, member, day, action)
-            text = render_daily_summary(db, config, day)
-
-    if action == "late":
-        await query.answer("Выбери, на сколько опоздаешь")
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"⏰ {html.escape(display_name(update.effective_user))}, на сколько опоздаешь?",
-            parse_mode=ParseMode.HTML,
-            reply_markup=delay_keyboard(member_id),
-        )
-        return
-
-    await query.answer("Сохранено ✅")
-    try:
-        await query.edit_message_text(
-            text=text, parse_mode=ParseMode.HTML, reply_markup=status_keyboard()
-        )
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            logger.info("Could not edit status card: %s", exc)
-    await refresh_saved_prompt(
-        context.application, chat_id, day, skip_message_id=query.message.message_id
-    )
-
-
-async def late_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.message or not update.effective_user:
-        return
-    _, requested_member_id, minutes_text = query.data.split(":")
-    chat_id = query.message.chat.id
-    with session_factory(context.application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        member = get_member(db, chat_id, update.effective_user.id)
-        if not config or not member or member.id != int(requested_member_id):
-            await query.answer("Эти кнопки предназначены другому участнику", show_alert=True)
-            return
-        day = local_day(config)
-        minutes = int(minutes_text)
-        arrival = calculate_arrival(config.school_start_time, minutes)
-        upsert_attendance(db, chat_id, member, day, "late", minutes, arrival)
-        summary = render_daily_summary(db, config, day)
-
-    await query.answer("Опоздание сохранено ✅")
-    await query.edit_message_text(
-        f"✅ {html.escape(member.display_name)}: опоздание на {minutes} мин, "
-        f"будет к {arrival}.",
-        parse_mode=ParseMode.HTML,
-    )
-    await refresh_saved_prompt(context.application, chat_id, day)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=summary,
-        parse_mode=ParseMode.HTML,
-        reply_markup=status_keyboard(),
-    )
-
-
-async def reaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.message or not update.effective_user:
-        return
-    _, attendance_id_text, verdict = query.data.split(":")
-    attendance_id = int(attendance_id_text)
-    chat_id = query.message.chat.id
-
-    with session_factory(context.application)() as db:
-        attendance = db.get(Attendance, attendance_id)
-        if not attendance or attendance.chat_id != chat_id:
-            await query.answer("Эта отметка уже недоступна", show_alert=True)
-            return
-        voter = get_member(db, chat_id, update.effective_user.id)
-        if not voter:
-            await query.answer("Сначала зарегистрируйся: /join", show_alert=True)
-            return
-        if voter.id == attendance.member_id:
-            await query.answer("Себя оценивать нельзя 🙂", show_alert=True)
-            return
-        reaction = db.scalar(
-            select(Reaction).where(
-                Reaction.attendance_id == attendance.id,
-                Reaction.voter_member_id == voter.id,
+        recipients = [member.private_chat_id for member in circle_members(db, stored_circle.id)]
+    for chat_id in recipients:
+        try:
+            await application.bot.send_message(
+                chat_id,
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=status_keyboard(),
             )
-        )
-        if not reaction:
-            reaction = Reaction(
-                attendance_id=attendance.id,
-                voter_member_id=voter.id,
-                verdict=verdict,
-            )
-            db.add(reaction)
-        else:
-            reaction.verdict = verdict
-        db.commit()
-        data = get_verification_data(db, attendance.id)
-        text = render_verification_card(data)
-        truth, lie = data[3], data[4]
-
-    await query.answer("Оценка сохранена")
-    try:
-        await query.edit_message_text(
-            text=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reaction_keyboard(attendance_id, truth, lie),
-        )
-    except BadRequest as exc:
-        if "message is not modified" not in str(exc).lower():
-            raise
-
-
-async def send_daily_prompt(application: Application, chat_id: int) -> None:
+        except Forbidden:
+            logger.info("Member %s blocked morning messages", chat_id)
+        except TelegramError:
+            logger.exception("Could not send morning message to %s", chat_id)
     with session_factory(application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if not config:
-            return
-        day = local_day(config)
-        text = render_daily_summary(db, config, day)
-    message = await application.bot.send_message(
-        chat_id=chat_id,
-        text="☀️ <b>Доброе утро!</b>\nПора отметиться.\n\n" + text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=status_keyboard(),
-    )
-    with session_factory(application)() as db:
-        config = db.get(GroupConfig, chat_id)
-        if config:
-            config.last_prompt_date = day
-            config.prompt_message_id = message.message_id
+        stored_circle = db.get(Circle, circle.id)
+        if stored_circle:
+            stored_circle.last_prompt_date = day
             db.commit()
 
 
 async def morning_tick(context: ContextTypes.DEFAULT_TYPE) -> None:
     with session_factory(context.application)() as db:
-        configs = list(db.scalars(select(GroupConfig)).all())
-    for config in configs:
-        now = datetime.now(ZoneInfo(config.timezone))
-        if now.strftime("%H:%M") < config.morning_time:
-            continue
-        if config.last_prompt_date == now.date():
-            continue
-        try:
-            await send_daily_prompt(context.application, config.chat_id)
-        except (Forbidden, BadRequest) as exc:
-            logger.warning("Cannot send morning prompt to %s: %s", config.chat_id, exc)
-        except TelegramError:
-            logger.exception("Telegram error while sending morning prompt to %s", config.chat_id)
+        circles = list(db.scalars(select(Circle)).all())
+    for circle in circles:
+        now = datetime.now(ZoneInfo(circle.timezone))
+        if now.strftime("%H:%M") >= circle.morning_time and circle.last_prompt_date != now.date():
+            try:
+                await send_morning_prompt(context.application, circle)
+            except TelegramError:
+                logger.exception("Could not send morning prompt for circle %s", circle.id)
 
 
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [
-            BotCommand("today", "отметиться и увидеть сегодняшний статус"),
-            BotCommand("verify", "проверить обещания за сегодня"),
+            BotCommand("start", "открыть главное меню"),
+            BotCommand("today", "отметиться и увидеть всех"),
+            BotCommand("verify", "проверить обещания"),
             BotCommand("stats", "общая статистика"),
             BotCommand("history", "история за 7 дней"),
-            BotCommand("members", "список участников"),
-            BotCommand("join", "зарегистрироваться"),
-            BotCommand("remove", "освободить место участника"),
-            BotCommand("settings", "посмотреть настройки"),
-            BotCommand("setup", "настроить группу и время"),
+            BotCommand("members", "участники и приглашение"),
+            BotCommand("invite", "получить ссылку для друзей"),
+            BotCommand("settings", "настройки времени"),
             BotCommand("help", "помощь"),
         ]
     )
@@ -780,37 +970,42 @@ async def post_init(application: Application) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled update error", exc_info=context.error)
+    error = context.error
+    logger.error(
+        "Unhandled update error",
+        exc_info=(type(error), error, error.__traceback__) if error else None,
+    )
 
 
 def build_application(app_settings: Settings) -> Application:
-    application = (
-        Application.builder().token(app_settings.bot_token).post_init(post_init).build()
-    )
+    application = Application.builder().token(app_settings.bot_token).post_init(post_init).build()
     application.bot_data["settings"] = app_settings
-    application.bot_data["session_factory"] = create_session_factory(
-        app_settings.database_url
-    )
+    application.bot_data["session_factory"] = create_session_factory(app_settings.database_url)
 
     application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("setup", setup_command))
+    application.add_handler(CommandHandler("create", create_command))
     application.add_handler(CommandHandler("join", join_command))
-    application.add_handler(CommandHandler("members", members_command))
-    application.add_handler(CommandHandler("remove", remove_command))
-    application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("today", today_command))
     application.add_handler(CommandHandler("verify", verify_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("members", members_command))
+    application.add_handler(CommandHandler("invite", invite_command))
+    application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("setup", setup_command))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(home_callback, pattern=r"^home:"))
+    application.add_handler(CallbackQueryHandler(nav_callback, pattern=r"^nav:"))
     application.add_handler(CallbackQueryHandler(status_callback, pattern=r"^s:"))
     application.add_handler(CallbackQueryHandler(late_callback, pattern=r"^l:"))
     application.add_handler(CallbackQueryHandler(reaction_callback, pattern=r"^r:"))
+    application.add_handler(CallbackQueryHandler(remove_member_callback, pattern=r"^m:remove:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     application.add_error_handler(error_handler)
     return application
 
 
 def main() -> None:
     app_settings = Settings.from_env()
-    logger.info("Starting school attendance bot")
+    logger.info("Starting private school-circle bot")
     build_application(app_settings).run_polling(drop_pending_updates=False)
