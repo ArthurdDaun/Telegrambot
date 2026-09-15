@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+    create_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class GroupConfig(Base):
+    __tablename__ = "group_configs"
+
+    chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), default="Школьная группа")
+    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
+    morning_time: Mapped[str] = mapped_column(String(5), default="07:00")
+    school_start_time: Mapped[str] = mapped_column(String(5), default="08:30")
+    last_prompt_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    prompt_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Member(Base):
+    __tablename__ = "members"
+    __table_args__ = (UniqueConstraint("chat_id", "telegram_user_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("group_configs.chat_id", ondelete="CASCADE"), index=True
+    )
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger)
+    display_name: Mapped[str] = mapped_column(String(255))
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    attendances: Mapped[list["Attendance"]] = relationship(
+        back_populates="member", cascade="all, delete-orphan"
+    )
+
+
+class Attendance(Base):
+    __tablename__ = "attendances"
+    __table_args__ = (UniqueConstraint("member_id", "day"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    member_id: Mapped[int] = mapped_column(
+        ForeignKey("members.id", ondelete="CASCADE"), index=True
+    )
+    day: Mapped[date] = mapped_column(Date, index=True)
+    status: Mapped[str] = mapped_column(String(24))
+    delay_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    arrival_time: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    member: Mapped[Member] = relationship(back_populates="attendances")
+    reactions: Mapped[list["Reaction"]] = relationship(
+        back_populates="attendance", cascade="all, delete-orphan"
+    )
+
+
+class Reaction(Base):
+    __tablename__ = "reactions"
+    __table_args__ = (UniqueConstraint("attendance_id", "voter_member_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    attendance_id: Mapped[int] = mapped_column(
+        ForeignKey("attendances.id", ondelete="CASCADE"), index=True
+    )
+    voter_member_id: Mapped[int] = mapped_column(
+        ForeignKey("members.id", ondelete="CASCADE"), index=True
+    )
+    verdict: Mapped[str] = mapped_column(String(16))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    attendance: Mapped[Attendance] = relationship(back_populates="reactions")
+
+
+def create_session_factory(database_url: str):
+    kwargs = {"pool_pre_ping": True}
+    if database_url.startswith("sqlite"):
+        kwargs["connect_args"] = {"check_same_thread": False}
+    engine = create_engine(database_url, **kwargs)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)
+
